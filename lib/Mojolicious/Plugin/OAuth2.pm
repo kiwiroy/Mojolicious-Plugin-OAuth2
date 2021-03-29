@@ -1,6 +1,7 @@
 package Mojolicious::Plugin::OAuth2;
 use Mojo::Base 'Mojolicious::Plugin';
 
+use Mojo::Loader 'load_class';
 use Mojo::Promise;
 use Mojo::UserAgent;
 use Carp 'croak';
@@ -51,7 +52,7 @@ sub register {
       $providers->{$provider}{$key} = $config->{$provider}{$key};
     }
   }
-
+  $self->_warmup_openid($app);
   $app->helper('oauth2.auth_url'    => sub { $self->_get_authorize_url($self->_args(@_)) });
   $app->helper('oauth2.providers'   => sub { $self->providers });
   $app->helper('oauth2.get_token_p' => sub { $self->_get_token($self->_args(@_), Mojo::Promise->new) });
@@ -70,6 +71,12 @@ sub register {
       my $p = Mojo::Promise->new;
       $p->then(sub { $c->$cb('', shift) })->catch(sub { $c->$cb(shift, undef) });
       return $self->_get_token($c, $args, $p);
+    }
+  );
+  $app->helper(
+    'oauth2.jwt_decode' => sub {
+      my ($c, $args) = $self->_args(@_);
+      return $self->providers->{$args->{provider}}{jwt}->decode($args->{data});
     }
   );
 
@@ -195,11 +202,44 @@ sub _mock_interface {
   );
 }
 
+sub _warmup_openid {
+  my ($self, $app) = (shift, shift);
+  my $providers = $self->providers;
+  for my $provider (keys %$providers) {
+    next unless my $well_known = $providers->{$provider}->{well_known_url};
+    $app->log->debug("Fetching OpenID configuration from $well_known");
+    $self->_warmup_openid_provider_p($provider, $well_known)->catch(sub { $app->log->error(shift) })->wait;
+  }
+  return $self;
+}
+
+sub _warmup_openid_provider_p {
+  my ($self, $provider, $well_known) = (shift, shift, shift);
+  my $providers = $self->providers;
+  Mojo::Promise->resolve->then(
+    sub {
+      if (my $e = load_class 'Mojo::JWT') {
+        die ref $e ? "Exception: $e" : 'Mojo::JWT Not found!';
+      }
+    }
+  )->then(sub { $self->_ua->get_p($well_known) })->then(
+    sub {
+      my $tx  = shift;
+      my $res = $tx->result->json;
+      $providers->{$provider}->{authorize_url}
+        = Mojo::URL->new($res->{authorization_endpoint})->query(response_type => 'code')->to_string;
+      $providers->{$provider}->{token_url} = $res->{token_endpoint};
+      $res;
+    }
+  )->then(sub { $self->_ua->get_p(shift->{jwks_uri}) })
+    ->then(sub { $providers->{$provider}->{jwt} = Mojo::JWT->new->add_jwkset(shift->result->json) });
+}
+
 1;
 
 =head1 NAME
 
-Mojolicious::Plugin::OAuth2 - Auth against OAuth2 APIs
+Mojolicious::Plugin::OAuth2 - Auth against OAuth2 APIs including OpenID Connect
 
 =head1 DESCRIPTION
 
@@ -224,6 +264,8 @@ L<IO::Socket::SSL> is installed.
 =item * L<http://homakov.blogspot.jp/2013/03/oauth1-oauth2-oauth.html>
 
 =item * L<http://en.wikipedia.org/wiki/OAuth#OAuth_2.0>
+
+=item * L<https://openid.net/connect/>
 
 =back
 
@@ -272,6 +314,17 @@ values are configuration for each provider. Here is a complete example:
       secret        => "SECRET_KEY",
       authorize_url => "https://provider.example.com/auth",
       token_url     => "https://provider.example.com/token",
+    },
+  };
+
+For L<OpenID Connect|https://openid.net/connect/>, C<authorize_url> and C<token_url> are configured from the
+C<well_known_url> so these are replaced by the C<well_known_url> key.
+
+  plugin "OAuth2" => {
+    openidconnect_provider => {
+      key            => "APP_ID",
+      secret         => "SECRET_KEY",
+      well_known_url => "https://provider.example.com/tenant-id/v2.0/.well-known/openid-configuration",
     },
   };
 
@@ -493,6 +546,11 @@ something like this:
     },
     ...
   }
+
+=head2 oauth2.jwt_decode
+
+When L<Mojolicious::Plugin::OAuth2> is being used in openid connect mode this helper allows you to decode the response
+data sent with the JWT initialised from C<well_known_url>.
 
 =head1 ATTRIBUTES
 
